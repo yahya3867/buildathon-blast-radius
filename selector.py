@@ -8,7 +8,18 @@ HERE = Path(__file__).parent
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 HUNK = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
 
-def affected(patch, coverage, tests):
+NONE_CHECK = re.compile(r"\bself\.(\w+) (is not|is|!=|==) None\b")
+POLARITY = {"is": True, "==": True, "is not": False, "!=": False}
+
+def equivalent_none_check(old, new, number, declarations):
+    left, right = NONE_CHECK.search(old), NONE_CHECK.search(new)
+    if not left or not right or left[1] != right[1] or POLARITY[left[2]] != POLARITY[right[2]]:
+        return False
+    if old[:left.start()] != new[:right.start()] or old[left.end():] != new[right.end():]:
+        return False
+    return any(begin <= number <= end and left[1] in fields for begin, end, fields in declarations)
+
+def affected(patch, coverage, tests, field_types):
     selected = 0
     file = ""
     line = 0
@@ -29,7 +40,16 @@ def affected(patch, coverage, tests):
                     selected |= 1 << i
         changed.clear()
         added = removed = False
-    for row in patch.splitlines():
+    rows = iter(patch.splitlines())
+    pending = next(rows, None)
+    while pending is not None:
+        row, pending = pending, next(rows, None)
+        if row.startswith("-") and not row.startswith("---") and pending and pending.startswith("+") and equivalent_none_check(
+                row[1:], pending[1:], line, field_types.get(file, ())):
+            flush()
+            line += 1
+            pending = next(rows, None)
+            continue
         if row.startswith("diff --git "):
             flush()
             file = row.partition(" b/")[2]
@@ -74,9 +94,11 @@ def schedule(chosen):
 def main():
     with gzip.open(HERE / "map.json.gz", "rt") as src:
         tests, coverage = json.load(src)
+    with gzip.open(HERE / "fields.json.gz", "rt") as src:
+        field_types = json.load(src)
     catalog = {t["id"]: t for t in json.loads((DATA / "tests.json").read_text())["tests"]}
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        bits = affected(patch.read_text(encoding="utf-8"), coverage, tests)
+        bits = affected(patch.read_text(encoding="utf-8"), coverage, tests, field_types)
         chosen = [catalog[t] for i,t in enumerate(tests) if bits & (1 << i) and t in catalog]
         print(json.dumps({"commit":patch.stem, "workers":schedule(chosen)}, separators=(",",":")))
 
